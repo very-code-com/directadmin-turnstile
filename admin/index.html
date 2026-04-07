@@ -1,0 +1,430 @@
+#!/usr/local/bin/php
+<?php
+/**
+ * Copyright 2026 Emilian Scibisz
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+$confFile = '/usr/local/directadmin/plugins/turnstile/conf/turnstile.conf';
+
+// Sandbox test keys (Cloudflare official)
+define('SANDBOX_SITE_KEY', '1x00000000000000000000AA');
+define('SANDBOX_SECRET_KEY', '1x0000000000000000000000000000000AA');
+
+// Detect DA environment dynamically
+$daUser = getenv('USERNAME') ?: get_current_user();
+$daHome = "/home/{$daUser}";
+$daConfRaw = @parse_ini_file('/usr/local/directadmin/conf/directadmin.conf', false, INI_SCANNER_RAW);
+$daHostname = $daConfRaw['servername'] ?? php_uname('n');
+$daPort = $daConfRaw['port'] ?? '2222';
+
+// i18n — load from external lang files, auto-detect from DA language switcher
+$daLang = strtolower(getenv('LANGUAGE') ?: 'en');
+$langDir = __DIR__ . '/../lang';
+$lang = 'en';
+
+// Match DA language code to available lang file (e.g. "pl", "pt_BR", "zh_CN")
+foreach (glob("{$langDir}/*.php") as $langFile) {
+    $code = basename($langFile, '.php');
+    if ($daLang === strtolower($code) || strpos($daLang, strtolower(explode('_', $code)[0])) === 0) {
+        $lang = $code;
+        break;
+    }
+}
+
+$langFile = "{$langDir}/{$lang}.php";
+if (!file_exists($langFile)) {
+    $langFile = "{$langDir}/en.php";
+}
+$i = require $langFile;
+$rawPost = getenv('POST') ?: '';
+
+function parseConf($file) {
+    $conf = [];
+    if (!file_exists($file)) return $conf;
+    foreach (file($file, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) as $line) {
+        $line = trim($line);
+        if ($line === '' || $line[0] === '#') continue;
+        $parts = explode('=', $line, 2);
+        if (count($parts) === 2) $conf[trim($parts[0])] = trim($parts[1]);
+    }
+    return $conf;
+}
+
+function writeConf($file, $conf) {
+    $lines = "# Cloudflare Turnstile Configuration\n";
+    $lines .= "# Managed by DirectAdmin plugin — do not edit manually\n\n";
+    foreach ($conf as $k => $v) {
+        $lines .= "{$k}={$v}\n";
+    }
+    $result = @file_put_contents($file, $lines);
+    if ($result === false) {
+        $err = error_get_last()['message'] ?? 'unknown error';
+        $GLOBALS['_write_error'] = "Cannot write config: {$err}";
+    }
+}
+
+$msg = '';
+$msgType = '';
+
+// Handle form submission — DA passes POST body in getenv('POST')
+if (getenv('REQUEST_METHOD') === 'POST') {
+    $raw = getenv('POST') ?: '';
+    parse_str($raw, $post);
+
+    $mode     = $post['MODE']      ?? 'sandbox';
+    $siteKey  = trim($post['SITE_KEY']   ?? '');
+    $secretKey= trim($post['SECRET_KEY'] ?? '');
+    $tokenTtl = $post['TOKEN_TTL'] ?? '300';
+    $failOpen = $post['FAIL_OPEN'] ?? 'yes';
+
+    if ($mode === 'off') {
+        $conf = [
+            'SITE_KEY'   => $siteKey ?: SANDBOX_SITE_KEY,
+            'SECRET_KEY' => $secretKey ?: SANDBOX_SECRET_KEY,
+            'ENABLED'    => 'no',
+            'MODE'       => 'off',
+            'TOKEN_TTL'  => $tokenTtl,
+            'FAIL_OPEN'  => $failOpen,
+        ];
+        writeConf($confFile, $conf);
+        if (!empty($GLOBALS['_write_error'])) { $msg = $GLOBALS['_write_error']; $msgType = 'error'; } else {
+        syncConf($confFile);
+        runPatch();
+        $msg = $i['msg_disabled'];
+        $msgType = 'success';
+        }
+    } elseif ($mode === 'sandbox') {
+        $conf = [
+            'SITE_KEY'   => SANDBOX_SITE_KEY,
+            'SECRET_KEY' => SANDBOX_SECRET_KEY,
+            'ENABLED'    => 'yes',
+            'MODE'       => 'sandbox',
+            'TOKEN_TTL'  => $tokenTtl,
+            'FAIL_OPEN'  => $failOpen,
+        ];
+        if (!empty($siteKey)) $conf['PROD_SITE_KEY'] = $siteKey;
+        if (!empty($secretKey)) $conf['PROD_SECRET_KEY'] = $secretKey;
+        writeConf($confFile, $conf);
+        if (!empty($GLOBALS['_write_error'])) { $msg = $GLOBALS['_write_error']; $msgType = 'error'; } else {
+        syncConf($confFile);
+        runPatch();
+        $msg = $i['msg_sandbox'];
+        $msgType = 'success';
+        }
+    } else {
+        // Production mode
+        if (empty($siteKey) || empty($secretKey)) {
+            $msg = $i['msg_keys_required'];
+            $msgType = 'error';
+        } else {
+            $conf = [
+                'SITE_KEY'   => $siteKey,
+                'SECRET_KEY' => $secretKey,
+                'ENABLED'    => 'yes',
+                'MODE'       => 'production',
+                'TOKEN_TTL'  => $tokenTtl,
+                'FAIL_OPEN'  => $failOpen,
+            ];
+            writeConf($confFile, $conf);
+            if (!empty($GLOBALS['_write_error'])) { $msg = $GLOBALS['_write_error']; $msgType = 'error'; } else {
+            syncConf($confFile);
+            runPatch();
+            $msg = $i['msg_saved'];
+            $msgType = 'success';
+            }
+        }
+    }
+}
+
+function syncConf($confFile) {
+    global $daUser, $daHome;
+
+    // Sync to DA user home for PHP-FPM access (open_basedir)
+    $syncDest = "{$daHome}/.turnstile.conf";
+    @copy($confFile, $syncDest);
+    @chown($syncDest, $daUser);
+    @chgrp($syncDest, $daUser);
+    @chmod($syncDest, 0640);
+
+    // For webapps pool (DA hostname vhost) — PrivateTmp blocks /tmp
+    @copy($confFile, "/var/www/.turnstile.conf");
+    @chmod("/var/www/.turnstile.conf", 0644);
+
+    // Shared location accessible by all pools
+    @copy($confFile, "/tmp/da_turnstile_conf");
+    @chmod("/tmp/da_turnstile_conf", 0644);
+}
+
+function runPatch() {
+    $patchScript = '/usr/local/directadmin/plugins/turnstile/scripts/patch_login.sh';
+    if (file_exists($patchScript)) {
+        exec("bash {$patchScript} 2>&1", $output, $rc);
+    }
+}
+
+// Load current config
+$conf = parseConf($confFile);
+$siteKey   = $conf['SITE_KEY']   ?? '';
+$secretKey = $conf['SECRET_KEY'] ?? '';
+$enabled   = $conf['ENABLED']    ?? 'yes';
+$mode      = $conf['MODE']       ?? ($enabled === 'no' ? 'off' : ($siteKey === SANDBOX_SITE_KEY ? 'sandbox' : 'production'));
+$tokenTtl  = $conf['TOKEN_TTL']  ?? '300';
+$failOpen  = $conf['FAIL_OPEN']  ?? 'yes';
+
+// For display: in sandbox mode, show saved prod keys if any
+$displaySiteKey   = ($mode === 'sandbox') ? ($conf['PROD_SITE_KEY'] ?? '') : $siteKey;
+$displaySecretKey = ($mode === 'sandbox') ? ($conf['PROD_SECRET_KEY'] ?? '') : $secretKey;
+if ($mode === 'production') {
+    $displaySiteKey = $siteKey;
+    $displaySecretKey = $secretKey;
+}
+
+// Check verification endpoint
+$verifyDir = '/tmp/da_turnstile';
+$verifyCount = 0;
+if (is_dir($verifyDir)) {
+    $verifyCount = count(glob("{$verifyDir}/*"));
+}
+
+// Check login.html patch status
+$loginHtml = @file_get_contents('/usr/local/directadmin/data/skins/evolution/login.html') ?: '';
+$isPatched = strpos($loginHtml, 'Turnstile Plugin') !== false;
+?>
+<style>
+    .ts-wrap { max-width: 760px; margin: 28px auto 40px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
+    .ts-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 24px; }
+    .ts-header-left { display: flex; align-items: center; gap: 14px; }
+    .ts-header-left img { width: 40px; height: 40px; }
+    .ts-header-right { display: flex; align-items: center; gap: 12px; }
+    .ts-card { background: #f8f9fa; border: 1px solid #dee2e6; border-radius: 12px; padding: 24px; margin-bottom: 20px; transition: border-color 0.2s; }
+    .ts-card:hover { border-color: #adb5bd; }
+    .ts-section-title { font-size: 15px; font-weight: 700; margin-bottom: 16px; display: flex; align-items: center; gap: 8px; color: #212529; }
+    .ts-title { font-size: 20px; font-weight: 700; margin-bottom: 4px; display: flex; align-items: center; gap: 8px; color: #212529; }
+    .ts-sub { color: #6c757d; font-size: 13px; }
+    .ts-field { margin-bottom: 16px; }
+    .ts-field label { display: block; font-weight: 600; margin-bottom: 6px; font-size: 13px; color: #495057; }
+    .ts-field input[type="text"], .ts-field input[type="password"], .ts-field input[type="number"], .ts-field select {
+        width: 100%; padding: 10px 14px; border: 1px solid #ced4da; border-radius: 8px;
+        background: #fff; color: #212529; font-size: 14px; box-sizing: border-box; transition: border-color 0.2s;
+    }
+    .ts-field input:focus, .ts-field select:focus { outline: none; border-color: #0a6daa; box-shadow: 0 0 0 3px rgba(10,109,170,0.15); }
+    .ts-field .hint { color: #868e96; font-size: 12px; margin-top: 4px; }
+    .ts-btn { background: linear-gradient(135deg, #0a6daa, #0880cc); color: #fff; border: none; padding: 12px 28px; border-radius: 8px;
+              font-size: 14px; font-weight: 600; cursor: pointer; transition: all 0.2s; box-shadow: 0 2px 8px rgba(10,109,170,0.3); }
+    .ts-btn:hover { background: linear-gradient(135deg, #0880cc, #0a99e6); transform: translateY(-1px); box-shadow: 0 4px 12px rgba(10,109,170,0.4); }
+    .ts-msg { padding: 14px 18px; border-radius: 10px; margin-bottom: 20px; font-size: 14px; display: flex; align-items: center; gap: 10px; }
+    .ts-msg.success { background: #d1fae5; border: 1px solid #6ee7b7; color: #065f46; }
+    .ts-msg.error { background: #fee2e2; border: 1px solid #fca5a5; color: #991b1b; }
+    .ts-badge { display: inline-flex; align-items: center; gap: 6px; padding: 5px 14px; border-radius: 20px; font-size: 12px; font-weight: 700; letter-spacing: 0.3px; text-transform: uppercase; }
+    .ts-badge.prod { background: #d1fae5; color: #065f46; border: 1px solid #6ee7b7; }
+    .ts-badge.sandbox { background: #fef3c7; color: #92400e; border: 1px solid #fcd34d; }
+    .ts-badge.off { background: #fee2e2; color: #991b1b; border: 1px solid #fca5a5; }
+    .ts-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 16px; }
+    .ts-stat { background: #fff; border: 1px solid #e5e7eb; border-radius: 10px; padding: 16px; text-align: center; }
+    .ts-stat .val { font-size: 20px; font-weight: 700; color: #212529; }
+    .ts-stat .lbl { font-size: 11px; color: #868e96; margin-top: 4px; text-transform: uppercase; letter-spacing: 0.5px; }
+    .ts-row { display: flex; gap: 16px; }
+    .ts-row .ts-field { flex: 1; }
+    .ts-modes { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; }
+    .ts-mode { padding: 16px; border: 2px solid #dee2e6; border-radius: 10px; cursor: pointer; text-align: center; transition: all 0.2s; background: #fff; }
+    .ts-mode:hover { border-color: #adb5bd; background: #f8f9fa; }
+    .ts-mode.selected { border-color: #0a6daa; background: #e8f4fd; }
+    .ts-mode .mode-icon { font-size: 24px; margin-bottom: 6px; }
+    .ts-mode .mode-label { font-weight: 700; font-size: 13px; margin-bottom: 4px; color: #212529; }
+    .ts-mode .mode-desc { font-size: 11px; color: #868e96; line-height: 1.4; }
+    .ts-keys-section { transition: opacity 0.3s; }
+    .ts-keys-section.disabled { opacity: 0.4; pointer-events: none; }
+    .ts-collapse-btn { background: none; border: none; color: #0a6daa; font-size: 13px; font-weight: 600; cursor: pointer; padding: 0; display: flex; align-items: center; gap: 4px; }
+    .ts-collapse-btn:hover { color: #0880cc; }
+    .ts-footer { text-align: center; color: #adb5bd; font-size: 11px; margin-top: 8px; padding-bottom: 12px; }
+    .ts-hiw-list { padding-left: 20px; line-height: 2; font-size: 13px; color: #6c757d; margin: 0; }
+    .ts-hiw-list code { background: #e9ecef; padding: 1px 6px; border-radius: 4px; font-size: 12px; color: #495057; }
+</style>
+
+<div class="ts-wrap">
+    <?php if ($msg): ?>
+        <div class="ts-msg <?= $msgType ?>">
+            <?= $msgType === 'success' ? '&check;' : '!' ?>
+            <?= htmlspecialchars($msg) ?>
+        </div>
+    <?php endif; ?>
+
+    <div class="ts-header">
+        <div class="ts-header-left">
+            <img src="/CMD_PLUGINS_ADMIN/turnstile/images/admin_icon.svg" alt="Turnstile" onerror="this.style.display='none'">
+            <div>
+                <div class="ts-title"><?= $i['title'] ?></div>
+                <div class="ts-sub"><?= $i['subtitle'] ?></div>
+            </div>
+        </div>
+        <div class="ts-header-right">
+            <?php if ($mode === 'production'): ?>
+                <span class="ts-badge prod">● <?= $i['status_active'] ?></span>
+            <?php elseif ($mode === 'sandbox'): ?>
+                <span class="ts-badge sandbox">⚠ <?= $i['status_sandbox'] ?></span>
+            <?php else: ?>
+                <span class="ts-badge off">○ <?= $i['status_off'] ?></span>
+            <?php endif; ?>
+        </div>
+    </div>
+
+    <form method="POST" action="/CMD_PLUGINS_ADMIN/turnstile" id="tsForm">
+
+        <!-- Mode selector -->
+        <div class="ts-card">
+            <div class="ts-section-title">⚙️ <?= $i['mode'] ?></div>
+            <div class="ts-modes">
+                <label class="ts-mode <?= $mode==='production'?'selected':'' ?>" onclick="selectMode('production')">
+                    <input type="radio" name="MODE" value="production" <?= $mode==='production'?'checked':'' ?> style="display:none">
+                    <div class="mode-icon">&bull;</div>
+                    <div class="mode-label"><?= $i['mode_prod'] ?></div>
+                    <div class="mode-desc"><?= $i['mode_prod_desc'] ?></div>
+                </label>
+                <label class="ts-mode <?= $mode==='sandbox'?'selected':'' ?>" onclick="selectMode('sandbox')">
+                    <input type="radio" name="MODE" value="sandbox" <?= $mode==='sandbox'?'checked':'' ?> style="display:none">
+                    <div class="mode-icon">🧪</div>
+                    <div class="mode-label"><?= $i['mode_sandbox'] ?></div>
+                    <div class="mode-desc"><?= $i['mode_sandbox_desc'] ?></div>
+                </label>
+                <label class="ts-mode <?= $mode==='off'?'selected':'' ?>" onclick="selectMode('off')">
+                    <input type="radio" name="MODE" value="off" <?= $mode==='off'?'checked':'' ?> style="display:none">
+                    <div class="mode-icon">🚫</div>
+                    <div class="mode-label"><?= $i['mode_off'] ?></div>
+                    <div class="mode-desc"><?= $i['mode_off_desc'] ?></div>
+                </label>
+            </div>
+        </div>
+
+        <!-- API Keys -->
+        <div class="ts-card ts-keys-section" id="keysSection">
+            <div class="ts-section-title"><?= $i['api_keys'] ?></div>
+            <div class="ts-sub" style="margin-bottom:16px;">
+                <?= $i['api_keys_desc'] ?> <a href="https://dash.cloudflare.com" target="_blank" style="color:#0a6daa;">Cloudflare Dashboard</a> → Turnstile
+            </div>
+
+            <div class="ts-field">
+                <label><?= $i['site_key'] ?></label>
+                <input type="text" name="SITE_KEY" id="siteKeyInput" value="<?= htmlspecialchars($displaySiteKey) ?>" placeholder="0x4AAAAAAA..." />
+                <div class="hint"><?= $i['site_key_hint'] ?></div>
+            </div>
+
+            <div class="ts-field">
+                <label><?= $i['secret_key'] ?></label>
+                <input type="password" name="SECRET_KEY" id="secretKeyInput" value="<?= htmlspecialchars($displaySecretKey) ?>" placeholder="0x4AAAAAAA..." />
+                <div class="hint"><?= $i['secret_key_hint'] ?></div>
+            </div>
+        </div>
+
+        <!-- Advanced settings -->
+        <div class="ts-card">
+            <button type="button" class="ts-collapse-btn" onclick="toggleAdvanced()" id="advBtn">▶ <?= $i['advanced'] ?></button>
+            <div id="advSection" style="display:none;margin-top:16px;">
+                <div class="ts-row">
+                    <div class="ts-field">
+                        <label><?= $i['token_ttl'] ?></label>
+                        <input type="number" name="TOKEN_TTL" value="<?= htmlspecialchars($tokenTtl) ?>" min="60" max="3600" />
+                        <div class="hint"><?= $i['token_ttl_hint'] ?></div>
+                    </div>
+                    <div class="ts-field">
+                        <label><?= $i['fail_open'] ?></label>
+                        <select name="FAIL_OPEN">
+                            <option value="yes" <?= $failOpen === 'yes' ? 'selected' : '' ?>><?= $i['fail_open_yes'] ?></option>
+                            <option value="no"  <?= $failOpen !== 'yes' ? 'selected' : '' ?>><?= $i['fail_open_no'] ?></option>
+                        </select>
+                        <div class="hint"><?= $i['fail_open_hint'] ?></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:24px;">
+            <button type="submit" class="ts-btn"><?= $i['save'] ?></button>
+        </div>
+    </form>
+
+    <!-- Status -->
+    <div class="ts-card">
+        <div class="ts-section-title">Status</div>
+        <div class="ts-grid">
+            <div class="ts-stat">
+                <div class="val"><?= $isPatched ? '&check;' : '&times;' ?></div>
+                <div class="lbl"><?= $i['login_patch'] ?></div>
+            </div>
+            <div class="ts-stat">
+                <div class="val"><?= $verifyCount ?></div>
+                <div class="lbl"><?= $i['active_verifications'] ?></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- How it works -->
+    <div class="ts-card">
+        <div class="ts-section-title" style="cursor:pointer;" onclick="toggleHowItWorks()" id="hiwBtn">📖 <?= $i['how_it_works'] ?> <span style="font-size:11px;color:#666;">▲</span></div>
+        <div id="hiwSection" style="margin-top:4px;">
+            <ol class="ts-hiw-list">
+                <li><?= $i['step1'] ?></li>
+                <li><?= $i['step2'] ?></li>
+                <li><?= sprintf($i['step3'], htmlspecialchars($daHostname)) ?></li>
+                <li><?= $i['step4'] ?></li>
+                <li><?= $i['step5'] ?></li>
+            </ol>
+        </div>
+    </div>
+
+    <div class="ts-footer">
+        Cloudflare Turnstile Plugin v1.0
+    </div>
+</div>
+
+<script>
+function selectMode(mode) {
+    document.querySelectorAll('.ts-mode').forEach(el => el.classList.remove('selected'));
+    document.querySelector('input[name="MODE"][value="'+mode+'"]').checked = true;
+    document.querySelector('input[name="MODE"][value="'+mode+'"]').closest('.ts-mode').classList.add('selected');
+    var keysSection = document.getElementById('keysSection');
+    if (mode === 'production') {
+        keysSection.classList.remove('disabled');
+    } else {
+        keysSection.classList.add('disabled');
+    }
+}
+
+function toggleAdvanced() {
+    var s = document.getElementById('advSection');
+    var b = document.getElementById('advBtn');
+    if (s.style.display === 'none') { s.style.display = 'block'; b.textContent = '▼ <?= $i['advanced'] ?>'; }
+    else { s.style.display = 'none'; b.textContent = '▶ <?= $i['advanced'] ?>'; }
+}
+
+function toggleHowItWorks() {
+    var s = document.getElementById('hiwSection');
+    var b = document.getElementById('hiwBtn');
+    var arrow = b.querySelector('span');
+    if (s.style.display === 'none') {
+        s.style.display = 'block';
+        arrow.textContent = '▲';
+    } else {
+        s.style.display = 'none';
+        arrow.textContent = '▼';
+    }
+}
+
+// Init: disable keys section if not production
+(function() {
+    var mode = document.querySelector('input[name="MODE"]:checked');
+    if (mode && mode.value !== 'production') {
+        document.getElementById('keysSection').classList.add('disabled');
+    }
+})();
+</script>

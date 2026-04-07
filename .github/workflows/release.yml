@@ -1,0 +1,49 @@
+name: Release Plugin
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build plugin archive
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Determine version
+        id: version
+        run: echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Update version in plugin.conf
+        run: |
+          VERSION="${{ steps.version.outputs.tag }}"
+          VERSION="${VERSION#v}"
+          sed -i "s/^version=.*/version=${VERSION}/" plugin.conf
+
+      - name: Build tar.gz (DA Plugin Manager format)
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          ARCHIVE="turnstile-${TAG}.tar.gz"
+
+          # Create temp dir with DA plugin ID as root
+          mkdir -p /tmp/turnstile
+          rsync -a --exclude='.git' --exclude='.github' --exclude='.gitignore' \
+            ./ /tmp/turnstile/
+
+          # Build archive with turnstile/ as root dir
+          tar -czf "${ARCHIVE}" -C /tmp turnstile
+
+          echo "archive=${ARCHIVE}" >> "$GITHUB_ENV"
+
+      - name: Upload release asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ steps.version.outputs.tag }}" \
+            "${{ env.archive }}" \
+            --clobber
